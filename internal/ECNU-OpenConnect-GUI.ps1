@@ -428,7 +428,8 @@ function Start-Connection {
     param(
         [Parameter(Mandatory)][string]$UserName,
         [System.Security.SecureString]$Password,
-        [bool]$RememberPassword
+        [bool]$RememberPassword,
+        [scriptblock]$ProgressAction
     )
 
     Ensure-Admin
@@ -522,6 +523,7 @@ function Start-Connection {
     }
 
     $connected = $false
+    $waitStartedAt = Get-Date
     $deadline = (Get-Date).AddSeconds([int]$config.LoginTimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
@@ -531,6 +533,10 @@ function Start-Connection {
         if ($logText -match 'X-CSTP-Address:|Configured as |Connected as ') {
             $connected = $true
             break
+        }
+        if ($ProgressAction) {
+            # 等待期间回吐一次进度：既能更新按钮上的提示，也让界面保持可响应。
+            try { & $ProgressAction ([int]((Get-Date) - $waitStartedAt).TotalSeconds) } catch { }
         }
     }
 
@@ -746,7 +752,8 @@ function Watch-Routes {
             Write-AppLog "Route watcher check failed: $($_.Exception.Message)" 'WARN'
             if ($misses -ge 5) { break }
         }
-        Start-Sleep -Seconds 3
+        # 路由守护间隔从 3 秒放宽到 10 秒：它的 WMI/CIM 查询会和界面抢资源，拉长间隔可减少界面卡顿。
+        Start-Sleep -Seconds 10
     }
     Remove-Item -LiteralPath $WatcherPidPath,$WatcherStopPath -Force -ErrorAction SilentlyContinue
     Write-AppLog 'Route watcher loop stopped.'
@@ -814,7 +821,14 @@ function Stop-OpenConnectForce {
 }
 
 function Get-StatusText {
-    $launcher = Get-SavedLauncherProcess
+    param([object]$Launcher)
+
+    if ($PSBoundParameters.ContainsKey('Launcher')) {
+        $launcher = $Launcher
+    }
+    else {
+        $launcher = Get-SavedLauncherProcess
+    }
     if (-not $launcher) { return '未连接' }
     $addr = Get-VpnAssignedAddress
     if ($addr) { return "已连接  $addr" }
@@ -970,8 +984,14 @@ function Start-Gui {
                     <TextBlock Text="用户名" Foreground="#606060" Margin="0,0,0,6"/>
                     <TextBox x:Name="UserText" Margin="0,0,0,14"/>
                     <TextBlock Text="密码" Foreground="#606060" Margin="0,0,0,6"/>
-                    <PasswordBox x:Name="PassText" Margin="0,0,0,12"/>
-                    <CheckBox x:Name="RememberCheck" Content="保存密码到本机" Margin="0,0,0,22"/>
+                    <Grid Margin="0,0,0,12">
+                        <PasswordBox x:Name="PassText"/>
+                        <TextBox x:Name="PassPlainText" Visibility="Collapsed"/>
+                    </Grid>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,22">
+                        <CheckBox x:Name="RememberCheck" Content="保存密码到本机"/>
+                        <CheckBox x:Name="ShowPasswordCheck" Content="显示密码" Margin="18,0,0,0"/>
+                    </StackPanel>
 
                     <Button x:Name="ActionButton" Content="登录" Style="{StaticResource PrimaryButton}" Margin="0,0,0,10"/>
                 </StackPanel>
@@ -1038,6 +1058,8 @@ function Start-Gui {
     $hostText = $window.FindName('HostText')
     $userText = $window.FindName('UserText')
     $passText = $window.FindName('PassText')
+    $passPlainText = $window.FindName('PassPlainText')
+    $showPasswordCheck = $window.FindName('ShowPasswordCheck')
     $rememberCheck = $window.FindName('RememberCheck')
     $routeList = $window.FindName('RouteList')
     $routeText = $window.FindName('RouteText')
@@ -1049,15 +1071,101 @@ function Start-Gui {
     $openLogButton = $window.FindName('OpenLogButton')
     $openLogFolderButton = $window.FindName('OpenLogFolderButton')
 
+    # 界面刷新缓存：进程查询（WMI）和凭据解密都比较慢，缓存后每 2.5 秒的刷新只做内存操作，
+    # 这样输入框不会再被后台刷新卡住。
+    $script:EcnuOcUiLauncherCache = $null
+    $script:EcnuOcUiLauncherCacheAt = [DateTime]::MinValue
+    $script:EcnuOcUiCredCache = $null
+    $script:EcnuOcUiCredCacheAt = [DateTime]::MinValue
+    $script:EcnuOcUiLogTail = ''
+    $script:EcnuOcRefreshQueued = $false
+    $script:EcnuOcBusy = $false
+    $script:EcnuOcUiActionButton = $actionButton
+    $script:EcnuOcUiWindow = $window
+
+    # 登录 / 退出期间按钮上的进度提示（登录时会带上已等待秒数）。
+    function Set-PrimaryBusyText([string]$Text) {
+        $script:EcnuOcBusyText = $Text
+        $script:EcnuOcUiActionButton.Content = $Text
+        $script:EcnuOcUiActionButton.ToolTip = "$Text 请稍候，完成后按钮会自动恢复。"
+        $script:EcnuOcUiActionButton.IsEnabled = $false
+        $trayActionItem.Text = $Text
+        $trayActionItem.Enabled = $false
+        # 立刻把进度提示画出来，再去执行可能比较慢的登录 / 退出操作。
+        $script:EcnuOcUiWindow.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background)
+    }
+
+    $script:EcnuOcLoginProgress = {
+        param([int]$Seconds)
+
+        $script:EcnuOcUiActionButton.Content = ('登录中… {0}s' -f $Seconds)
+        $script:EcnuOcUiWindow.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background)
+    }
+
+    function Get-UiLauncher {
+        param([switch]$Force)
+
+        if (-not $Force -and ((Get-Date) - $script:EcnuOcUiLauncherCacheAt).TotalMilliseconds -lt 3000) {
+            return $script:EcnuOcUiLauncherCache
+        }
+        $script:EcnuOcUiLauncherCache = Get-SavedLauncherProcess
+        $script:EcnuOcUiLauncherCacheAt = Get-Date
+        return $script:EcnuOcUiLauncherCache
+    }
+
+    function Get-UiSavedCredential {
+        param([switch]$Force)
+
+        if (-not $Force -and ((Get-Date) - $script:EcnuOcUiCredCacheAt).TotalSeconds -lt 5) {
+            return $script:EcnuOcUiCredCache
+        }
+        $script:EcnuOcUiCredCache = Get-SavedCredential
+        $script:EcnuOcUiCredCacheAt = Get-Date
+        return $script:EcnuOcUiCredCache
+    }
+
+    function Get-PasswordText {
+        if ($showPasswordCheck.IsChecked) { return [string]$passPlainText.Text }
+        return [string]$passText.Password
+    }
+
+    function Set-PasswordText([string]$Value) {
+        $passText.Password = [string]$Value
+        $passPlainText.Text = [string]$Value
+    }
+
+    function Clear-PasswordText {
+        $passText.Clear()
+        $passPlainText.Clear()
+    }
+
+    function Sync-PasswordVisibility {
+        if ($showPasswordCheck.IsChecked) {
+            $passPlainText.Text = [string]$passText.Password
+            $passPlainText.Visibility = 'Visible'
+            $passText.Visibility = 'Collapsed'
+            [void]$passPlainText.Focus()
+            $passPlainText.CaretIndex = $passPlainText.Text.Length
+        }
+        else {
+            $passText.Password = [string]$passPlainText.Text
+            $passText.Visibility = 'Visible'
+            $passPlainText.Visibility = 'Collapsed'
+            [void]$passText.Focus()
+        }
+    }
+
+    $showPasswordCheck.Add_Click({ Sync-PasswordVisibility })
+
     $hostText.Text = "服务器：$($config.Host)    认证组：$($config.AuthGroup)    默认不走代理"
     $logPathText.Text = $LogPath
     if ($savedCred) {
         $userText.Text = [string]$savedCred.UserName
         try {
-            $passText.Password = ConvertFrom-SecureStringToPlain $savedCred.Password
+            Set-PasswordText (ConvertFrom-SecureStringToPlain $savedCred.Password)
         }
         catch {
-            $passText.Clear()
+            Clear-PasswordText
         }
     }
     else {
@@ -1136,89 +1244,122 @@ function Start-Gui {
         }
         $window.Activate() | Out-Null
         $script:EcnuOcWasMinimizedToTray = $false
+        # 窗口重新显示后立刻补一次刷新，日志不用等下一个定时周期。
+        Refresh-Ui
     }
 
     function Refresh-Ui {
-        $running = [bool](Get-SavedLauncherProcess)
-        $status.Text = Get-StatusText
-        $trayStatusItem.Text = $status.Text
-        $notifyIcon.Text = if ($status.Text.Length -gt 63) { $status.Text.Substring(0, 63) } else { "ECNU OpenConnect - $($status.Text)" }
-        if ($running) {
-            $actionButton.Content = '退出登录'
-            $actionButton.Style = $dangerButtonStyle
-            $trayActionItem.Text = '退出登录'
-            $userText.IsEnabled = $false
-            $passText.IsEnabled = $false
-            $rememberCheck.IsEnabled = $false
-        }
-        else {
-            $actionButton.Content = '登录'
-            $actionButton.Style = $primaryButtonStyle
-            $trayActionItem.Text = '登录'
-            $userText.IsEnabled = $true
-            $passText.IsEnabled = $true
-            $rememberCheck.IsEnabled = $true
-            $saved = Get-SavedCredential
-            if ($saved -and [string]::IsNullOrWhiteSpace($userText.Text)) {
-                $userText.Text = $saved.UserName
+        $launcher = Get-UiLauncher
+        $running = [bool]$launcher
+        $statusText = Get-StatusText -Launcher $launcher
+        # 登录 / 退出登录进行中时，按钮和状态由 Invoke-PrimaryAction 接管，
+        # 这里不要覆盖按钮上的进度提示。
+        if (-not $script:EcnuOcBusy) {
+            if ($status.Text -ne $statusText) { $status.Text = $statusText }
+            if ($trayStatusItem.Text -ne $statusText) { $trayStatusItem.Text = $statusText }
+            $trayTip = if ($statusText.Length -gt 63) { $statusText.Substring(0, 63) } else { "ECNU OpenConnect - $statusText" }
+            if ($notifyIcon.Text -ne $trayTip) { $notifyIcon.Text = $trayTip }
+            if ($running) {
+                if ($actionButton.Content -ne '退出登录') { $actionButton.Content = '退出登录' }
+                $actionButton.ToolTip = '断开当前 OpenConnect 连接'
+                $actionButton.Style = $dangerButtonStyle
+                if ($trayActionItem.Text -ne '退出登录') { $trayActionItem.Text = '退出登录' }
+                if ($userText.IsEnabled) { $userText.IsEnabled = $false }
+                if ($passText.IsEnabled) { $passText.IsEnabled = $false }
+                if ($passPlainText.IsEnabled) { $passPlainText.IsEnabled = $false }
+                if ($rememberCheck.IsEnabled) { $rememberCheck.IsEnabled = $false }
+                if ($showPasswordCheck.IsEnabled) { $showPasswordCheck.IsEnabled = $false }
             }
-            if ($saved -and [string]::IsNullOrWhiteSpace($passText.Password)) {
-                try {
-                    $passText.Password = ConvertFrom-SecureStringToPlain $saved.Password
+            else {
+                if ($actionButton.Content -ne '登录') { $actionButton.Content = '登录' }
+                $actionButton.ToolTip = '连接 ECNU VPN'
+                $actionButton.Style = $primaryButtonStyle
+                if ($trayActionItem.Text -ne '登录') { $trayActionItem.Text = '登录' }
+                if (-not $userText.IsEnabled) { $userText.IsEnabled = $true }
+                if (-not $passText.IsEnabled) { $passText.IsEnabled = $true }
+                if (-not $passPlainText.IsEnabled) { $passPlainText.IsEnabled = $true }
+                if (-not $rememberCheck.IsEnabled) { $rememberCheck.IsEnabled = $true }
+                if (-not $showPasswordCheck.IsEnabled) { $showPasswordCheck.IsEnabled = $true }
+                $saved = Get-UiSavedCredential
+                if ($saved -and [string]::IsNullOrWhiteSpace($userText.Text)) {
+                    $userText.Text = $saved.UserName
                 }
-                catch {
-                    $passText.Clear()
+                if ($saved -and [string]::IsNullOrWhiteSpace((Get-PasswordText))) {
+                    try {
+                        Set-PasswordText (ConvertFrom-SecureStringToPlain $saved.Password)
+                    }
+                    catch {
+                        Clear-PasswordText
+                    }
                 }
             }
         }
-        $logText.Text = Get-LogTail
-        $logText.CaretIndex = $logText.Text.Length
-        $logText.ScrollToEnd()
+        # 日志只在窗口（也就是日志面板）可见时刷新：隐藏到托盘或最小化时不再读日志、不动文本框，
+        # 这样后台几乎没有额外开销；窗口重新显示时会由 Show-MainWindow 立刻补一次。
+        $logVisible = $window.IsVisible -and $window.WindowState -ne [Windows.WindowState]::Minimized
+        if ($logVisible) {
+            $tail = Get-LogTail
+            if ($tail -ne $script:EcnuOcUiLogTail) {
+                $script:EcnuOcUiLogTail = $tail
+                $logText.Text = $tail
+                $logText.CaretIndex = $tail.Length
+                $logText.ScrollToEnd()
+            }
+        }
     }
 
     function Invoke-PrimaryAction {
+        if ($script:EcnuOcBusy) { return }
+        $script:EcnuOcBusy = $true
+        $message = ''
+        $messageTitle = 'ECNU OpenConnect'
+        $messageIcon = 'Information'
         try {
-            $actionButton.IsEnabled = $false
-            $trayActionItem.Enabled = $false
             if (Get-SavedLauncherProcess) {
-                $status.Text = '正在退出登录...'
-                $window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background)
+                Set-PrimaryBusyText '退出登录中…'
+                $status.Text = '正在退出登录，请稍候…'
                 Stop-Connection
-                Refresh-Ui
-                Show-UserMessage -Text '已退出登录。'
+                Get-UiLauncher -Force | Out-Null
+                $message = '已退出登录。'
             }
             else {
-                $status.Text = '正在登录...'
-                $window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background)
+                Set-PrimaryBusyText '登录中…'
+                $status.Text = '正在登录，请稍候…'
                 Save-RoutesFromList
                 if (Get-SavedLauncherProcess) {
                     throw '当前已登录，请先退出登录。'
                 }
-                $secure = ConvertTo-SecureStringFromPlain $passText.Password
-                Start-Connection -UserName $userText.Text.Trim() -Password $secure -RememberPassword:([bool]$rememberCheck.IsChecked)
-                $passText.Clear()
-                Refresh-Ui
-                Show-UserMessage -Text '登录流程已启动，路由策略已应用。'
+                $secure = ConvertTo-SecureStringFromPlain (Get-PasswordText)
+                Start-Connection -UserName $userText.Text.Trim() -Password $secure -RememberPassword:([bool]$rememberCheck.IsChecked) -ProgressAction $script:EcnuOcLoginProgress
+                Clear-PasswordText
+                Get-UiLauncher -Force | Out-Null
+                $message = '登录流程已启动，路由策略已应用。'
             }
         }
         catch {
-            Refresh-Ui
-            if (Get-SavedLauncherProcess) {
-                Show-UserMessage -Text '当前已登录，请先退出登录。'
+            if ($_.Exception.Message -match '认证失败|authentication|Login failed|Password:\s*fgets') {
+                Remove-SavedCredential
+                $script:EcnuOcUiCredCacheAt = [DateTime]::MinValue
+                Clear-PasswordText
+            }
+            if (Get-UiLauncher -Force) {
+                $message = '当前已登录，请先退出登录。'
             }
             else {
-                if ($_.Exception.Message -match '认证失败|authentication|Login failed|Password:\s*fgets') {
-                    Remove-SavedCredential
-                    $passText.Clear()
-                    $passText.IsEnabled = $true
-                    $rememberCheck.IsEnabled = $true
-                }
-                Show-UserMessage -Text $_.Exception.Message -Title '登录失败' -Icon 'Error'
+                $messageTitle = '登录失败'
+                $messageIcon = 'Error'
+                $message = $_.Exception.Message
             }
         }
         finally {
+            $script:EcnuOcBusy = $false
+            $script:EcnuOcBusyText = ''
+            Refresh-Ui
             $actionButton.IsEnabled = $true
             $trayActionItem.Enabled = $true
+        }
+        if ($message) {
+            Show-UserMessage -Text $message -Title $messageTitle -Icon $messageIcon
         }
     }
 
@@ -1267,7 +1408,22 @@ function Start-Gui {
 
     $timer = New-Object Windows.Threading.DispatcherTimer
     $timer.Interval = [TimeSpan]::FromMilliseconds(2500)
-    $timer.Add_Tick({ Refresh-Ui })
+    $timer.Add_Tick({
+        if ($script:EcnuOcRefreshQueued) { return }
+        $script:EcnuOcRefreshQueued = $true
+        try {
+            # 用 Background 优先级排队刷新：用户正在打字时优先处理输入事件，避免输入被刷新卡住。
+            $window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background, [Action]{
+                try { Refresh-Ui }
+                catch { }
+                finally { $script:EcnuOcRefreshQueued = $false }
+            }) | Out-Null
+        }
+        catch {
+            $script:EcnuOcRefreshQueued = $false
+            Refresh-Ui
+        }
+    })
     $timer.Start()
 
     $window.Add_Closing({
