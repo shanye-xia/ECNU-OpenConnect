@@ -1,0 +1,13 @@
+﻿{
+    "Host":  "vpn-ct.ecnu.edu.cn",
+    "AuthGroup":  "ECNU",
+    "RememberPassword":  true,
+    "AllowedRoutes":  [
+                          "172.0.0.0/8"
+                      ],
+    "CloseToTrayTipShown":  true,
+    "LoginTimeoutSeconds":  50,
+    "UserAgent":  "AnyConnect Linux_64 5.1.02042",
+    "VersionString":  "5.1.02042",
+    "Os":  "linux-64"
+}

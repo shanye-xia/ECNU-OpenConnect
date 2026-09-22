@@ -1,0 +1,16 @@
+internal/*.login.xml
+internal/*.username.txt
+internal/*.password.xml
+internal/*.credential.xml
+internal/*.log
+internal/*.pid
+internal/*.pid.json
+internal/*.stop
+internal/*-state.json
+internal/*-backup.json
+internal/openconnect/Online Documentation.url
+internal/openconnect/Uninstall OpenConnect.exe
+internal/openconnect/*.bak
+*.lnk
+*.zip
+release/
