@@ -28,7 +28,7 @@ var env = ws.Environment("Process");
 // Equivalent to vpn-slice, but kept inside this bundled OpenConnect script.
 // ECNU_SPLIT_ROUTES is set by the GUI, for example:
 //   172.0.0.0/8,202.120.0.0/16,202.120.80.2/32
-var ecnuDefaultSplitRoutes = "172.0.0.0/8";
+var ecnuDefaultSplitRoutes = "172.0.0.0/8,202.120.0.0/16";
 
 function ecnuMaskFromBits(bits) {
     var octets = [];

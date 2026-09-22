@@ -3,7 +3,8 @@
     "AuthGroup":  "ECNU",
     "RememberPassword":  true,
     "AllowedRoutes":  [
-                          "172.0.0.0/8"
+                          "172.0.0.0/8",
+                          "202.120.0.0/16"
                       ],
     "CloseToTrayTipShown":  true,
     "LoginTimeoutSeconds":  50,
